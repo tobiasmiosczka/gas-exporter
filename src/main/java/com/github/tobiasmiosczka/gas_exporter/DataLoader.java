@@ -29,11 +29,11 @@ public class DataLoader {
             AppProperties appProperties,
             GasDataService gasDataService) {
         this.priceClient = priceClient;
-        this.positions = appProperties.getPositions();
+        this.positions = appProperties.positions();
         this.gasDataService = gasDataService;
     }
 
-    @Scheduled(cron = "${app.schedule:0 0/10 * * * *}")
+    @Scheduled(cron = "${app.schedule:0 0/1 * * * *}")
     public void loadData() {
         Instant time = Instant.now();
         Flux<Station> stationFlux = priceClient.loadStations(positions);

@@ -1,56 +1,109 @@
 package com.github.tobiasmiosczka.gas_exporter.service.impl;
 
+import com.github.tobiasmiosczka.gas_exporter.config.AppProperties;
 import com.github.tobiasmiosczka.gas_exporter.model.dto.Station;
-import com.github.tobiasmiosczka.gas_exporter.model.entity.PriceEntity;
-import com.github.tobiasmiosczka.gas_exporter.model.entity.StationEntity;
-import com.github.tobiasmiosczka.gas_exporter.repository.PriceRepository;
-import com.github.tobiasmiosczka.gas_exporter.repository.StationRepository;
 import com.github.tobiasmiosczka.gas_exporter.service.GasDataService;
-import org.springframework.dao.DataIntegrityViolationException;
+import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBConnection;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 
 @Service
 public class GasDataServiceImpl implements GasDataService {
 
-    private final StationRepository stationRepository;
-    private final PriceRepository priceRepository;
+    private static final Logger LOGGER = LoggerFactory.getLogger(GasDataServiceImpl.class);
 
-    public GasDataServiceImpl(
-            StationRepository stationRepository,
-            PriceRepository priceRepository) {
-        this.stationRepository = stationRepository;
-        this.priceRepository = priceRepository;
+    private static final String CREATE_TABLE = """
+            CREATE TABLE prices (
+                time         TIMESTAMPTZ NOT NULL,
+                station_id   UUID NOT NULL,
+                name         VARCHAR,
+                brand        VARCHAR,
+                latitude     DOUBLE,
+                longitude    DOUBLE,
+                post_code    VARCHAR,
+                place        VARCHAR,
+                street       VARCHAR,
+                house_number VARCHAR,
+                is_open      BOOLEAN,
+                e5           DECIMAL(5,3),
+                e10          DECIMAL(5,3),
+                diesel       DECIMAL(5,3),
+                year         INTEGER NOT NULL,
+                month        INTEGER NOT NULL,
+                day          INTEGER NOT NULL
+            )""";
+
+    private final Path outputPath;
+
+    public GasDataServiceImpl(AppProperties appProperties) {
+        this.outputPath = Path.of(appProperties.outputPath()).toAbsolutePath().normalize();
     }
 
     public Mono<Void> processStations(Flux<Station> stations, Instant time) {
-        return stations.concatMap(s -> stationRepository.upsert(convert(s))
-                .onErrorResume(DataIntegrityViolationException.class, e -> Mono.empty())
-                .thenMany(savePrice(s, time))
-                .then(), 10).then();
+        return stations.bufferTimeout(1000, Duration.ofMinutes(1))
+                .concatMap(batch -> processBatch(batch, time))
+                .then();
     }
 
-    private static StationEntity convert(Station s) {
-        return new StationEntity(
-                s.getId(),
-                s.getName(),
-                s.getBrand(),
-                s.getLat(),
-                s.getLng(),
-                String.valueOf(s.getPostCode()),
-                s.getPlace(),
-                s.getStreet(),
-                s.getHouseNumber());
+    private Mono<Void> processBatch(List<Station> batch, Instant time) {
+        return Mono.<Void>fromCallable(() -> {
+                    LOGGER.info("Processing batch of {} stations", batch.size());
+                    writeParquet(batch, time);
+                    return null;
+                })
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
-    private Flux<PriceEntity> savePrice(Station s, Instant time) {
-        return priceRepository.saveAll(List.of(
-                new PriceEntity(time, s.getId(), "e5", s.getE5()),
-                new PriceEntity(time, s.getId(), "e10", s.getE10()),
-                new PriceEntity(time, s.getId(), "diesel", s.getDiesel())));
+    private void writeParquet(List<Station> batch, Instant time) throws SQLException, IOException {
+        Files.createDirectories(outputPath);
+        OffsetDateTime timestamp = time.atOffset(ZoneOffset.UTC);
+        LocalDate date = timestamp.toLocalDate();
+        try (DuckDBConnection connection = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
+             Statement statement = connection.createStatement()) {
+            statement.execute(CREATE_TABLE);
+            try (DuckDBAppender appender = connection.createAppender(DuckDBConnection.DEFAULT_SCHEMA, "prices")) {
+                for (Station s : batch) {
+                    appender.beginRow()
+                            .append(timestamp)
+                            .append(s.getId())
+                            .append(s.getName())
+                            .append(s.getBrand())
+                            .append(s.getLat())
+                            .append(s.getLng())
+                            .append(s.getPostCode() == null ? null : String.valueOf(s.getPostCode()))
+                            .append(s.getPlace())
+                            .append(s.getStreet())
+                            .append(s.getHouseNumber())
+                            .append(s.isOpen())
+                            .append(s.getE5())
+                            .append(s.getE10())
+                            .append(s.getDiesel())
+                            .append(date.getYear())
+                            .append(date.getMonthValue())
+                            .append(date.getDayOfMonth())
+                            .endRow();
+                }
+            }
+            statement.execute("COPY prices TO '" + outputPath.toString().replace("'", "''") + "' "
+                    + "(FORMAT parquet, PARTITION_BY (year, month, day), APPEND)");
+        }
     }
 }
