@@ -16,7 +16,7 @@ RUN java -Djarmode=layertools -jar app.jar extract
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
-RUN groupadd --system spring && useradd --system --gid spring --no-create-home spring
+RUN groupadd --system spring && useradd --system --gid spring --create-home spring
 USER spring:spring
 
 COPY --from=builder /app/dependencies/ ./
