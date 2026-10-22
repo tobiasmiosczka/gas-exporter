@@ -12,11 +12,11 @@ WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 RUN java -Djarmode=layertools -jar app.jar extract
 
-# Stage 3: Runtime
-FROM eclipse-temurin:21-alpine
+# Stage 3: Runtime (glibc-based: DuckDB's native library does not run on Alpine/musl)
+FROM eclipse-temurin:21-jre
 WORKDIR /app
 
-RUN addgroup -S spring && adduser -S spring -G spring
+RUN groupadd --system spring && useradd --system --gid spring --no-create-home spring
 USER spring:spring
 
 COPY --from=builder /app/dependencies/ ./
