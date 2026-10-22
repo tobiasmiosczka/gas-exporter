@@ -76,6 +76,7 @@ public class GasDataServiceImpl implements GasDataService {
             try (Statement statement = connection.createStatement()) {
                 statement.execute(initS3());
             }
+            LOGGER.info("Initialized S3 connection to {}", properties.storageEndpoint());
             try (Statement statement = connection.createStatement()) {
                 statement.execute(CREATE_TABLE);
             }
@@ -102,6 +103,7 @@ public class GasDataServiceImpl implements GasDataService {
                             .endRow();
                 }
             }
+            LOGGER.info("Appended {} rows, writing to s3://{}/", batch.size(), properties.storageBucket());
             try (Statement statement = connection.createStatement()) {
                 statement.execute("""
                         COPY prices TO 's3://%s/' (
@@ -111,6 +113,7 @@ public class GasDataServiceImpl implements GasDataService {
                         )
                         """.formatted(properties.storageBucket()));
             }
+            LOGGER.info("Wrote {} rows to s3://{}/", batch.size(), properties.storageBucket());
         }
     }
 
