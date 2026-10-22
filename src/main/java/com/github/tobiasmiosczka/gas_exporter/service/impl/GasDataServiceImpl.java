@@ -12,9 +12,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -29,6 +26,8 @@ import java.util.List;
 public class GasDataServiceImpl implements GasDataService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GasDataServiceImpl.class);
+
+    private final AppProperties properties;
 
     private static final String CREATE_TABLE = """
             CREATE TABLE prices (
@@ -51,10 +50,8 @@ public class GasDataServiceImpl implements GasDataService {
                 day          INTEGER NOT NULL
             )""";
 
-    private final Path outputPath;
-
     public GasDataServiceImpl(AppProperties appProperties) {
-        this.outputPath = Path.of(appProperties.outputPath()).toAbsolutePath().normalize();
+        this.properties = appProperties;
     }
 
     public Mono<Void> processStations(Flux<Station> stations, Instant time) {
@@ -72,13 +69,16 @@ public class GasDataServiceImpl implements GasDataService {
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
-    private void writeParquet(List<Station> batch, Instant time) throws SQLException, IOException {
-        Files.createDirectories(outputPath);
+    private void writeParquet(List<Station> batch, Instant time) throws SQLException {
         OffsetDateTime timestamp = time.atOffset(ZoneOffset.UTC);
         LocalDate date = timestamp.toLocalDate();
-        try (DuckDBConnection connection = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:");
-             Statement statement = connection.createStatement()) {
-            statement.execute(CREATE_TABLE);
+        try (DuckDBConnection connection = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:")) {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(initS3());
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(CREATE_TABLE);
+            }
             try (DuckDBAppender appender = connection.createAppender(DuckDBConnection.DEFAULT_SCHEMA, "prices")) {
                 for (Station s : batch) {
                     appender.beginRow()
@@ -102,8 +102,35 @@ public class GasDataServiceImpl implements GasDataService {
                             .endRow();
                 }
             }
-            statement.execute("COPY prices TO '" + outputPath.toString().replace("'", "''") + "' "
-                    + "(FORMAT parquet, PARTITION_BY (year, month, day), APPEND)");
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("""
+                        COPY prices TO 's3://%s/' (
+                            FORMAT parquet,
+                            PARTITION_BY (year, month, day),
+                            APPEND
+                        )
+                        """.formatted(properties.storageBucket()));
+            }
         }
+    }
+
+    private String initS3() {
+        return """
+                INSTALL httpfs;
+                LOAD httpfs;
+                
+                CREATE SECRET garage (
+                    TYPE s3,
+                    KEY_ID '%s',
+                    SECRET '%s',
+                    ENDPOINT '%s',
+                    REGION 'garage',
+                    URL_STYLE 'path',
+                    USE_SSL false
+                );
+                """.formatted(
+                properties.storageAccessKey(),
+                properties.storageSecret(),
+                properties.storageEndpoint());
     }
 }

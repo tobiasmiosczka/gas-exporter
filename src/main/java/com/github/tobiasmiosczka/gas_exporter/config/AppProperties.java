@@ -8,5 +8,8 @@ import java.util.Set;
 @ConfigurationProperties(prefix = "app")
 public record AppProperties (
         Set<Position> positions,
-        String outputPath
+        String storageAccessKey,
+        String storageSecret,
+        String storageEndpoint,
+        String storageBucket
 ) {}
