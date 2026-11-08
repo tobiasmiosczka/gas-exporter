@@ -12,7 +12,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -27,9 +26,9 @@ public class GasDataServiceImpl implements GasDataService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GasDataServiceImpl.class);
 
-    private static final int MAX_S3_RETRIES = 2;
-
     private final AppProperties properties;
+
+    private final DuckDbConnectionFactory connectionFactory;
 
     private static final String CREATE_TABLE = """
             CREATE TABLE prices (
@@ -52,8 +51,9 @@ public class GasDataServiceImpl implements GasDataService {
                 day          INTEGER NOT NULL
             )""";
 
-    public GasDataServiceImpl(AppProperties appProperties) {
+    public GasDataServiceImpl(AppProperties appProperties, DuckDbConnectionFactory connectionFactory) {
         this.properties = appProperties;
+        this.connectionFactory = connectionFactory;
     }
 
     public Mono<Void> processStations(Flux<Station> stations, Instant time) {
@@ -74,11 +74,7 @@ public class GasDataServiceImpl implements GasDataService {
     private void writeParquet(List<Station> batch, Instant time) throws SQLException {
         OffsetDateTime timestamp = time.atOffset(ZoneOffset.UTC);
         LocalDate date = timestamp.toLocalDate();
-        try (DuckDBConnection connection = (DuckDBConnection) DriverManager.getConnection("jdbc:duckdb:")) {
-            try (Statement statement = connection.createStatement()) {
-                statement.execute(initS3());
-            }
-            LOGGER.info("Initialized S3 connection to {}", properties.storageEndpoint());
+        try (DuckDBConnection connection = connectionFactory.openWithS3()) {
             try (Statement statement = connection.createStatement()) {
                 statement.execute(CREATE_TABLE);
             }
@@ -116,32 +112,10 @@ public class GasDataServiceImpl implements GasDataService {
                         """.formatted(properties.storageBucket()));
             } catch (SQLException e) {
                 LOGGER.error("Failed to write {} rows to s3://{}/ after {} retries, aborting",
-                        batch.size(), properties.storageBucket(), MAX_S3_RETRIES);
+                        batch.size(), properties.storageBucket(), DuckDbConnectionFactory.MAX_S3_RETRIES);
                 throw e;
             }
             LOGGER.info("Wrote {} rows to s3://{}/", batch.size(), properties.storageBucket());
         }
-    }
-
-    private String initS3() {
-        return """
-                INSTALL httpfs;
-                LOAD httpfs;
-                SET http_retries = %d;
-
-                CREATE SECRET garage (
-                    TYPE s3,
-                    KEY_ID '%s',
-                    SECRET '%s',
-                    ENDPOINT '%s',
-                    REGION 'garage',
-                    URL_STYLE 'path',
-                    USE_SSL false
-                );
-                """.formatted(
-                MAX_S3_RETRIES,
-                properties.storageAccessKey(),
-                properties.storageSecret(),
-                properties.storageEndpoint());
     }
 }
