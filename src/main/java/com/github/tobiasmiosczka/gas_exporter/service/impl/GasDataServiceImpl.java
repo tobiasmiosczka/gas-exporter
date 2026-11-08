@@ -27,6 +27,8 @@ public class GasDataServiceImpl implements GasDataService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GasDataServiceImpl.class);
 
+    private static final int MAX_S3_RETRIES = 2;
+
     private final AppProperties properties;
 
     private static final String CREATE_TABLE = """
@@ -112,6 +114,10 @@ public class GasDataServiceImpl implements GasDataService {
                             APPEND
                         )
                         """.formatted(properties.storageBucket()));
+            } catch (SQLException e) {
+                LOGGER.error("Failed to write {} rows to s3://{}/ after {} retries, aborting",
+                        batch.size(), properties.storageBucket(), MAX_S3_RETRIES);
+                throw e;
             }
             LOGGER.info("Wrote {} rows to s3://{}/", batch.size(), properties.storageBucket());
         }
@@ -121,7 +127,8 @@ public class GasDataServiceImpl implements GasDataService {
         return """
                 INSTALL httpfs;
                 LOAD httpfs;
-                
+                SET http_retries = %d;
+
                 CREATE SECRET garage (
                     TYPE s3,
                     KEY_ID '%s',
@@ -132,6 +139,7 @@ public class GasDataServiceImpl implements GasDataService {
                     USE_SSL false
                 );
                 """.formatted(
+                MAX_S3_RETRIES,
                 properties.storageAccessKey(),
                 properties.storageSecret(),
                 properties.storageEndpoint());
