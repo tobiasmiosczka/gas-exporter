@@ -59,10 +59,11 @@ public class CompactionJob {
         dates.concatMap(date -> compactionService.compactDay(date)
                         .doOnError(e -> LOGGER.error("Compaction of {} failed: ", date, e))
                         .onErrorComplete())
-                .doOnComplete(() -> LOGGER.info("{} compaction finished", trigger))
-                .doOnError(e -> LOGGER.error("{} compaction failed: ", trigger, e))
                 .doFinally(signal -> running.set(false))
-                .subscribe();
+                .subscribe(
+                        null,
+                        e -> LOGGER.error("{} compaction failed: ", trigger, e),
+                        () -> LOGGER.info("{} compaction finished", trigger));
     }
 
 }

@@ -10,14 +10,13 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.CommonPrefix;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.LocalDate;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.TreeSet;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -28,7 +27,7 @@ public class CompactionServiceImpl implements CompactionService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(CompactionServiceImpl.class);
 
-    private static final Pattern PARTITION_PATTERN = Pattern.compile("/year=(\\d+)/month=(\\d+)/day=(\\d+)/");
+    private static final Pattern PARTITION_PATTERN = Pattern.compile("^year=(\\d+)/month=(\\d+)/day=(\\d+)/$");
 
     private final AppProperties properties;
 
@@ -53,69 +52,82 @@ public class CompactionServiceImpl implements CompactionService {
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
+    // Walks the partition directories via delimiter listings instead of listing every file in the bucket,
+    // so the number of requests depends on the number of days, not on the number of files.
     public Flux<LocalDate> listPartitionDates() {
-        return Mono.fromCallable(() -> {
-                    String bucketPrefix = "s3://%s/".formatted(properties.storageBucket());
-                    try (DuckDBConnection connection = connectionFactory.openWithS3()) {
-                        return listFiles(connection, bucketPrefix + "year=*/month=*/day=*/*.parquet");
-                    }
-                })
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMapIterable(files -> files.stream()
+        return Mono.fromCallable(() -> listPrefixes("year=").stream()
+                        .flatMap(year -> listPrefixes(year + "month=").stream())
+                        .flatMap(month -> listPrefixes(month + "day=").stream())
                         .map(PARTITION_PATTERN::matcher)
-                        .filter(Matcher::find)
+                        .filter(Matcher::matches)
                         .map(matcher -> LocalDate.of(
                                 Integer.parseInt(matcher.group(1)),
                                 Integer.parseInt(matcher.group(2)),
                                 Integer.parseInt(matcher.group(3))))
-                        .collect(Collectors.toCollection(TreeSet::new)));
+                        .sorted()
+                        .toList())
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMapIterable(dates -> dates);
     }
 
     private void compact(LocalDate date) throws SQLException {
-        String partition = "year=%d/month=%d/day=%d".formatted(
+        String partition = "year=%d/month=%d/day=%d/".formatted(
                 date.getYear(), date.getMonthValue(), date.getDayOfMonth());
-        String bucketPrefix = "s3://%s/".formatted(properties.storageBucket());
-        try (DuckDBConnection connection = connectionFactory.openWithS3()) {
-            List<String> files = listFiles(connection, bucketPrefix + partition + "/*.parquet");
-            if (files.size() <= 1) {
-                LOGGER.info("Partition {} has {} file(s), nothing to compact", partition, files.size());
-                return;
-            }
-            String target = bucketPrefix + partition + "/compacted_" + UUID.randomUUID() + ".parquet";
-            LOGGER.info("Compacting {} files of partition {} into {}", files.size(), partition, target);
+        List<String> keys = listParquetKeys(partition);
+        if (keys.size() <= 1) {
+            LOGGER.info("Partition {} has {} file(s), nothing to compact", partition, keys.size());
+            return;
+        }
+        String target = toS3Url(partition + "compacted_" + UUID.randomUUID() + ".parquet");
+        LOGGER.info("Compacting {} files of partition {} into {}", keys.size(), partition, target);
+        try (DuckDBConnection connection = connectionFactory.openWithS3();
+             Statement statement = connection.createStatement()) {
             // DISTINCT removes duplicates left behind by a previous run that failed after writing
-            try (Statement statement = connection.createStatement()) {
-                statement.execute("""
-                        COPY (
-                            SELECT DISTINCT *
-                            FROM read_parquet([%s], hive_partitioning = false)
-                            ORDER BY station_id, time
-                        ) TO '%s' (FORMAT parquet)
-                        """.formatted(toSqlList(files), target));
-            }
-            for (String file : files) {
-                s3Client.deleteObject(request -> request
+            statement.execute("""
+                    COPY (
+                        SELECT DISTINCT *
+                        FROM read_parquet([%s], hive_partitioning = false)
+                        ORDER BY station_id, time
+                    ) TO '%s' (FORMAT parquet)
+                    """.formatted(toSqlList(keys), target));
+        }
+        for (String key : keys) {
+            s3Client.deleteObject(request -> request
+                    .bucket(properties.storageBucket())
+                    .key(key));
+        }
+        LOGGER.info("Compacted {} files of partition {} into {}", keys.size(), partition, target);
+    }
+
+    private List<String> listPrefixes(String prefix) {
+        return s3Client.listObjectsV2Paginator(request -> request
                         .bucket(properties.storageBucket())
-                        .key(file.substring(bucketPrefix.length())));
-            }
-            LOGGER.info("Compacted {} files of partition {} into {}", files.size(), partition, target);
-        }
+                        .prefix(prefix)
+                        .delimiter("/"))
+                .commonPrefixes()
+                .stream()
+                .map(CommonPrefix::prefix)
+                .toList();
     }
 
-    private List<String> listFiles(DuckDBConnection connection, String pattern) throws SQLException {
-        List<String> files = new ArrayList<>();
-        try (Statement statement = connection.createStatement();
-             ResultSet resultSet = statement.executeQuery("SELECT file FROM glob('%s')".formatted(pattern))) {
-            while (resultSet.next()) {
-                files.add(resultSet.getString(1));
-            }
-        }
-        return files;
+    private List<String> listParquetKeys(String prefix) {
+        return s3Client.listObjectsV2Paginator(request -> request
+                        .bucket(properties.storageBucket())
+                        .prefix(prefix))
+                .contents()
+                .stream()
+                .map(S3Object::key)
+                .filter(key -> key.endsWith(".parquet"))
+                .toList();
     }
 
-    private static String toSqlList(List<String> files) {
-        return files.stream()
-                .map(file -> "'" + file.replace("'", "''") + "'")
+    private String toS3Url(String key) {
+        return "s3://%s/%s".formatted(properties.storageBucket(), key);
+    }
+
+    private String toSqlList(List<String> keys) {
+        return keys.stream()
+                .map(key -> "'" + toS3Url(key).replace("'", "''") + "'")
                 .collect(Collectors.joining(", "));
     }
 }
